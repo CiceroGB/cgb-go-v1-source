@@ -1,6 +1,6 @@
-# cgb-go-v1-source - Código Fonte Completo
+# cgb-go-v1 - Rinha de Backend 2025
 
-**Código fonte completo** da solução cgb-go-v1 para Rinha de Backend 2025.
+Sistema de intermediação de pagamentos desenvolvido em Go para a Rinha de Backend 2025.
 
 ## 🚀 Arquitetura
 
@@ -37,11 +37,7 @@ cd rinha-de-backend-2025/rinha-test
 k6 run rinha.js
 ```
 
-## 📝 Submissão
+## 📝 Links
 
-**Repositório de submissão**: https://github.com/CiceroGB/cgb-go-v1
-**Docker Hub**: cicerocg/rinha-v1:latest
-
----
-
-Desenvolvido para Rinha de Backend 2025 🚀
+- **Submissão oficial**: https://github.com/CiceroGB/cgb-go-v1
+- **Docker Hub**: cicerocg/rinha-v1:latest
