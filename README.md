@@ -19,15 +19,22 @@ Sistema monolítico em Go com foco em performance:
 ## 🛠️ Como Executar
 
 ```bash
-# 1. Subir Payment Processors
+# 1. Preparar dependências Go
+go mod tidy
+
+# 2. Subir Payment Processors (obrigatório primeiro)
 cd rinha-de-backend-2025/payment-processor
 docker-compose up -d
 
-# 2. Subir solução
+# 3. Subir solução
 docker-compose up --build -d
 
-# 3. Testar
+# 4. Testar básico
 curl http://localhost:9999/healthcheck
+
+# 5. Testar performance (k6)
+cd rinha-de-backend-2025/rinha-test
+k6 run rinha.js
 ```
 
 ## 📝 Submissão
