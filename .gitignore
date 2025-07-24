@@ -1,0 +1,41 @@
+# Binários
+main
+cgb-go-v1
+*.exe
+
+# Go
+*.log
+vendor/
+*.mod.backup
+*.sum.backup
+
+# Docker
+.dockerignore.backup
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary
+tmp/
+temp/
+*.tmp
+
+# Logs
+*.log
+logs/
+
+# Claude AI files
+CLAUDE.md
+claude.md
+*.claude
+
+# Build artifacts
+dist/
+build/
