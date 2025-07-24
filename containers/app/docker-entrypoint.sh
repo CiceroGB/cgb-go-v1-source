@@ -17,4 +17,4 @@ echo "GOMEMLIMIT: $GOMEMLIMIT"
 
 # Executar aplicação
 echo "Iniciando Rinha v1 API..."
-exec ./app
+exec ./rinha-backend
