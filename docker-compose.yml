@@ -1,71 +1,109 @@
-# Rinha v1 - Solução para Rinha de Backend 2025
-# Versão LOCAL para build da imagem (não usar para submissão!)
-# Para submissão, usar docker-compose.yml com imagem do Docker Hub
-
-version: '3.8'
-
 services:
-  # Redis Cache para gerenciamento de filas e persistência
-  rinha-redis:
+  redis:
     image: redis:8.0.3-alpine
-    container_name: rinha-redis
-    restart: always
-    command: >
-      redis-server
-      --save ""
-      --appendonly no
-      --maxclients 10000
-      --tcp-keepalive 60
-      --timeout 300
+    container_name: cgb-redis
+    restart: unless-stopped
+    command:
+      [
+        "redis-server",
+        "--save",
+        "",
+        "--appendonly",
+        "no",
+        "--maxclients",
+        "10000",
+        "--tcp-backlog",
+        "511",
+        "--timeout",
+        "0",
+        "--tcp-keepalive",
+        "300"
+      ]
     networks:
-      - rinha-network
-      - payment-processor
-    ports:
-      - "6379:6379"
+      - backend
     deploy:
       resources:
         limits:
-          cpus: "0.15"
-          memory: "50MB"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
+          cpus: "0.2"
+          memory: "65MB"
 
-  # API Go Monolítica - BUILD LOCAL
-  rinha-v1-api:
+  api1:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: rinha-v1-api
-    ports:
-      - "9999:8080"
+    container_name: cgb-api1
     networks:
-      - rinha-network
-      - payment-processor
+      - backend
     depends_on:
-      rinha-redis:
-        condition: service_healthy
+      - redis
     environment:
-      - REDIS_URL=rinha-redis:6379
-      - DEFAULT_PROCESSOR_URL=http://payment-processor-default:8080
-      - FALLBACK_PROCESSOR_URL=http://payment-processor-fallback:8080
+      - REDIS_URL=redis:6379
+      - MODE=api
     deploy:
       resources:
         limits:
-          cpus: "1.35"
-          memory: "300MB"
-      restart_policy:
-        condition: on-failure
-        delay: 3s
-        max_attempts: 5
+          cpus: '0.3'
+          memory: '70MB'
 
-# Redes
+  api2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cgb-api2
+    networks:
+      - backend
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis:6379
+      - MODE=api
+    deploy:
+      resources:
+        limits:
+          cpus: '0.3'
+          memory: '70MB'
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cgb-worker
+    networks:
+      - backend
+      - payment-processor
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis:6379
+      - DEFAULT_PROCESSOR_URL=http://payment-processor-default:8080
+      - FALLBACK_PROCESSOR_URL=http://payment-processor-fallback:8080
+      - MODE=worker
+    deploy:
+      resources:
+        limits:
+          cpus: '0.45'
+          memory: '105MB'
+
+  nginx:
+    image: nginx:1.27.0-alpine
+    container_name: cgb-nginx
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - 9999:9999
+    depends_on:
+      - api1
+      - api2
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: '40MB'
+
 networks:
-  rinha-network:
+  backend:
     driver: bridge
-    name: rinha-network
   payment-processor:
     external: true
-    name: payment-processor

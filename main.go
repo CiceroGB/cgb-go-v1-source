@@ -471,6 +471,24 @@ var inMemoryQueue = make(chan PaymentData, inMemoryQueueSize)
 
 // enqueueTransaction - Adiciona transação na fila in-memory (não-bloqueante)
 func enqueueTransaction(payment PaymentData) error {
+	mode := getEnvVar("MODE", "monolith")
+	
+	// MODO API HÍBRIDO: processar direto quando possível, Redis como fallback
+	if mode == "api" {
+		// Tentar fila in-memory primeiro (ultra-rápido)
+		select {
+		case inMemoryQueue <- payment:
+			return nil
+		default:
+			// Fila cheia - fallback para Redis
+			transactionData, err := fastJson.Marshal(payment)
+			if err != nil {
+				return fmt.Errorf("erro ao serializar transação: %w", err)
+			}
+			return redisConnection.RPush(context.Background(), paymentQueueKey, transactionData).Err()
+		}
+	}
+	
 	// Modo monolítico: usar fila in-memory real (sem Redis no hot path)
 	select {
 	case inMemoryQueue <- payment:
@@ -868,8 +886,8 @@ func getTransactionsSummary(ctx *fasthttp.RequestCtx) {
 func main() {
 	connectRedis()
 	
-	// Arquitetura monolítica: API + Worker no mesmo processo
-	log.Println("Iniciando modo monolitico")
+	// Verificar modo de operação via variável de ambiente
+	mode := getEnvVar("MODE", "monolith")
 	
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -883,26 +901,61 @@ func main() {
 		cancel()
 	}()
 
-	// Inicia workers de processamento em background
-	go startProcessingSystem(ctx)
-	
-	// Inicia gerenciador de health checks
-	go func() {
-		heartbeat := time.NewTicker(2 * time.Second) // Reduzido de 1s para 2s
-		defer heartbeat.Stop()
+	switch mode {
+	case "api":
+		log.Println("Iniciando modo API HÍBRIDO")
+		// API com workers próprios para eliminar latência do Redis
+		go startProcessingSystem(ctx)
+		runHTTPServer(ctx)
+		
+	case "worker":
+		log.Println("Iniciando modo Worker")
+		// Apenas workers de processamento
+		go startProcessingSystem(ctx)
+		
+		// Inicia gerenciador de health checks
+		go func() {
+			heartbeat := time.NewTicker(2 * time.Second)
+			defer heartbeat.Stop()
 
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-heartbeat.C:
-				runHealthManager()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-heartbeat.C:
+					runHealthManager()
+				}
 			}
-		}
-	}()
+		}()
+		
+		// Aguarda sinal de encerramento
+		<-ctx.Done()
+		
+	default:
+		// Modo monolítico (fallback)
+		log.Println("Iniciando modo monolítico")
+		
+		// Inicia workers de processamento em background
+		go startProcessingSystem(ctx)
+		
+		// Inicia gerenciador de health checks
+		go func() {
+			heartbeat := time.NewTicker(2 * time.Second)
+			defer heartbeat.Stop()
 
-	// Inicia servidor HTTP (blocking)
-	runHTTPServer(ctx)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-heartbeat.C:
+					runHealthManager()
+				}
+			}
+		}()
+
+		// Inicia servidor HTTP (blocking)
+		runHTTPServer(ctx)
+	}
 }
 
 // runHTTPServer - Servidor HTTP monolítico (API + Workers no mesmo processo)
