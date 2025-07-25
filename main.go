@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,6 +34,13 @@ var fallbackProcessorURL = getEnvVar("FALLBACK_PROCESSOR_URL", "http://payment-p
 
 // Cache do modo de operação (performance crítica - evita getEnvVar no hot path)
 var appMode = getEnvVar("MODE", "monolith")
+
+// Object pools para reduzir GC pressure (performance crítica)
+var paymentDataPool = &sync.Pool{
+	New: func() interface{} {
+		return &PaymentData{}
+	},
+}
 
 // Configurações do Redis e fila in-memory
 const (
@@ -83,6 +91,12 @@ func getEnvVar(key, defaultValue string) string {
 type PaymentData struct {
 	CorrelationID string  `json:"correlationId"`
 	Amount        float64 `json:"amount"`
+}
+
+// Reset - Limpa dados para reutilização no pool (performance crítica)
+func (p *PaymentData) Reset() {
+	p.CorrelationID = ""
+	p.Amount = 0
 }
 
 // Validate - Verifica se os dados do pagamento são válidos
@@ -818,15 +832,21 @@ func checkSystemStatus(ctx *fasthttp.RequestCtx) {
 	ctx.SetBodyString(`{"status":"sistema_operacional"}`)
 }
 
-// receivePaymentRequest - Endpoint para receber novos pagamentos
+// receivePaymentRequest - Endpoint para receber novos pagamentos (otimizado com object pool)
 func receivePaymentRequest(ctx *fasthttp.RequestCtx) {
 	if !ctx.IsPost() {
 		ctx.SetStatusCode(fasthttp.StatusMethodNotAllowed)
 		return
 	}
 
-	var paymentData PaymentData
-	if err := fastJson.Unmarshal(ctx.PostBody(), &paymentData); err != nil {
+	// Obter objeto do pool para reduzir GC pressure
+	paymentData := paymentDataPool.Get().(*PaymentData)
+	defer func() {
+		paymentData.Reset()
+		paymentDataPool.Put(paymentData)
+	}()
+
+	if err := fastJson.Unmarshal(ctx.PostBody(), paymentData); err != nil {
 		ctx.SetStatusCode(fasthttp.StatusBadRequest)
 		ctx.SetBodyString("formato de dados inválido")
 		return
@@ -838,7 +858,7 @@ func receivePaymentRequest(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	if err := enqueueTransaction(paymentData); err != nil {
+	if err := enqueueTransaction(*paymentData); err != nil {
 		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
 		ctx.SetBodyString("falha ao processar solicitação")
 		return
