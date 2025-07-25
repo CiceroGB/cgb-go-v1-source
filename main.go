@@ -501,7 +501,7 @@ func enqueueTransaction(payment PaymentData) error {
 			// Fila cheia - fallback para Redis (otimizado com buffer pool)
 			transactionData, err := fastJson.Marshal(payment)
 			if err != nil {
-				return fmt.Errorf("erro ao serializar transação: %w", err)
+				return err
 			}
 			return redisConnection.RPush(bgContext, paymentQueueKey, transactionData).Err()
 		}
@@ -516,7 +516,7 @@ func enqueueTransaction(payment PaymentData) error {
 		// Fila cheia - fallback direto para Redis (otimizado)
 		transactionData, err := fastJson.Marshal(payment)
 		if err != nil {
-			return fmt.Errorf("erro ao serializar transação: %w", err)
+			return err
 		}
 		return redisConnection.RPush(bgContext, paymentQueueKey, transactionData).Err()
 	}
@@ -889,8 +889,16 @@ func clearDatabase(ctx *fasthttp.RequestCtx) {
 
 // getTransactionsSummary - Endpoint para obter resumo de transações
 func getTransactionsSummary(ctx *fasthttp.RequestCtx) {
-	startDate := string(ctx.QueryArgs().Peek("from"))
-	endDate := string(ctx.QueryArgs().Peek("to"))
+	startDateBytes := ctx.QueryArgs().Peek("from")
+	endDateBytes := ctx.QueryArgs().Peek("to")
+	
+	var startDate, endDate string
+	if len(startDateBytes) > 0 {
+		startDate = string(startDateBytes)
+	}
+	if len(endDateBytes) > 0 {
+		endDate = string(endDateBytes)
+	}
 
 	report, err := generatePaymentsReport(startDate, endDate)
 	if err != nil {
@@ -900,7 +908,8 @@ func getTransactionsSummary(ctx *fasthttp.RequestCtx) {
 	}
 
 	ctx.SetContentType("application/json")
-	json.NewEncoder(ctx).Encode(report)
+	reportJSON, _ := fastJson.Marshal(report)
+	ctx.SetBody(reportJSON)
 }
 
 // ============================================================================
@@ -910,7 +919,7 @@ func getTransactionsSummary(ctx *fasthttp.RequestCtx) {
 func main() {
 	connectRedis()
 	
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(bgContext)
 	defer cancel()
 
 	// Captura sinais do sistema para encerramento gracioso
