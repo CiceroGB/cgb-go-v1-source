@@ -1,0 +1,71 @@
+# Rinha v1 - Solução para Rinha de Backend 2025
+# Versão LOCAL para build da imagem (não usar para submissão!)
+# Para submissão, usar docker-compose.yml com imagem do Docker Hub
+
+version: '3.8'
+
+services:
+  # Redis Cache para gerenciamento de filas e persistência
+  rinha-redis:
+    image: redis:8.0.3-alpine
+    container_name: rinha-redis
+    restart: always
+    command: >
+      redis-server
+      --save ""
+      --appendonly no
+      --maxclients 10000
+      --tcp-keepalive 60
+      --timeout 300
+    networks:
+      - rinha-network
+      - payment-processor
+    ports:
+      - "6379:6379"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.15"
+          memory: "50MB"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # API Go Monolítica - BUILD LOCAL
+  rinha-v1-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rinha-v1-api
+    ports:
+      - "9999:8080"
+    networks:
+      - rinha-network
+      - payment-processor
+    depends_on:
+      rinha-redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=rinha-redis:6379
+      - DEFAULT_PROCESSOR_URL=http://payment-processor-default:8080
+      - FALLBACK_PROCESSOR_URL=http://payment-processor-fallback:8080
+    deploy:
+      resources:
+        limits:
+          cpus: "1.35"
+          memory: "300MB"
+      restart_policy:
+        condition: on-failure
+        delay: 3s
+        max_attempts: 5
+
+# Redes
+networks:
+  rinha-network:
+    driver: bridge
+    name: rinha-network
+  payment-processor:
+    external: true
+    name: payment-processor
