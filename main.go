@@ -31,6 +31,9 @@ var fastJson = jsoniter.ConfigFastest
 var defaultProcessorURL = getEnvVar("DEFAULT_PROCESSOR_URL", "http://payment-processor-default:8080")
 var fallbackProcessorURL = getEnvVar("FALLBACK_PROCESSOR_URL", "http://payment-processor-fallback:8080")
 
+// Cache do modo de operação (performance crítica - evita getEnvVar no hot path)
+var appMode = getEnvVar("MODE", "monolith")
+
 // Configurações do Redis e fila in-memory
 const (
 	paymentQueueKey = "payment_queue"
@@ -471,10 +474,8 @@ var inMemoryQueue = make(chan PaymentData, inMemoryQueueSize)
 
 // enqueueTransaction - Adiciona transação na fila in-memory (não-bloqueante)
 func enqueueTransaction(payment PaymentData) error {
-	mode := getEnvVar("MODE", "monolith")
-	
 	// MODO API HÍBRIDO: processar direto quando possível, Redis como fallback
-	if mode == "api" {
+	if appMode == "api" {
 		// Tentar fila in-memory primeiro (ultra-rápido)
 		select {
 		case inMemoryQueue <- payment:
@@ -886,9 +887,6 @@ func getTransactionsSummary(ctx *fasthttp.RequestCtx) {
 func main() {
 	connectRedis()
 	
-	// Verificar modo de operação via variável de ambiente
-	mode := getEnvVar("MODE", "monolith")
-	
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -901,7 +899,7 @@ func main() {
 		cancel()
 	}()
 
-	switch mode {
+	switch appMode {
 	case "api":
 		log.Println("Iniciando modo API HÍBRIDO")
 		// API com workers próprios para eliminar latência do Redis
