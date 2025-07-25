@@ -62,7 +62,7 @@ const (
 const (
 	processorCacheKey     = "active_processor_cache"
 	selectionLockKey      = "processor_selection_lock"
-	cacheLifetime         = 10 * time.Second
+	cacheLifetime         = 15 * time.Second
 	selectionLockTimeout  = 3 * time.Second
 	
 	healthControlKey      = "health_check_control"
@@ -70,8 +70,8 @@ const (
 	healthCheckInterval   = 5 * time.Second
 	healthLockTimeout     = 5 * time.Second
 	
-	maxLatencyMs          = 50
-	latencyDifferenceMs   = 50
+	maxLatencyMs          = 100
+	latencyDifferenceMs   = 80
 )
 
 // ============================================================================
@@ -419,10 +419,10 @@ func saveProcessorCache(ctx context.Context, processor string, defaultHealth, fa
 	return redisConnection.Set(ctx, processorCacheKey, cacheData, cacheLifetime).Err()
 }
 
-// chooseBestProcessor - Algoritmo para escolher o melhor processador
+// chooseBestProcessor - Algoritmo para escolher o melhor processador (otimizado para lucro)
 func chooseBestProcessor(defaultHealth, fallbackHealth *HealthStatus) string {
 	switch {
-	case defaultHealth != nil && !defaultHealth.Failing && (fallbackHealth == nil || fallbackHealth.Failing):
+	case defaultHealth != nil && !defaultHealth.Failing && defaultHealth.ResponseTime <= 150:
 		return "default"
 
 	case fallbackHealth != nil && !fallbackHealth.Failing && (defaultHealth == nil || defaultHealth.Failing):
@@ -432,7 +432,8 @@ func chooseBestProcessor(defaultHealth, fallbackHealth *HealthStatus) string {
 		return "default"
 
 	case defaultHealth != nil && fallbackHealth != nil && !defaultHealth.Failing && !fallbackHealth.Failing:
-		if preferDefaultProcessor(defaultHealth, fallbackHealth) {
+		// Preferir default se diferença de latência não for muito grande
+		if defaultHealth.ResponseTime <= fallbackHealth.ResponseTime + 100 {
 			return "default"
 		}
 		return "fallback"
@@ -441,12 +442,14 @@ func chooseBestProcessor(defaultHealth, fallbackHealth *HealthStatus) string {
 	return "default"
 }
 
-// preferDefaultProcessor - Decide se deve usar o processador padrão baseado na latência
+// preferDefaultProcessor - Decide se deve usar o processador padrão baseado na latência (otimizado para lucro)
 func preferDefaultProcessor(defaultHealth, fallbackHealth *HealthStatus) bool {
+	// PRIORIZAR DEFAULT para maximizar lucro (taxa menor) mas sem ser extremo
+	// Usar fallback apenas se default estiver bem mais lento ou falhando
 	if defaultHealth.ResponseTime <= maxLatencyMs {
 		return true
 	}
-	if fallbackHealth.ResponseTime <= maxLatencyMs {
+	if fallbackHealth.ResponseTime <= maxLatencyMs && defaultHealth.ResponseTime > 300 {
 		return false
 	}
 	return defaultHealth.ResponseTime < fallbackHealth.ResponseTime+latencyDifferenceMs
