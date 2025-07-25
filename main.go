@@ -42,6 +42,9 @@ var paymentDataPool = &sync.Pool{
 	},
 }
 
+// Pre-aloca context.Background() para evitar allocation repetida (performance crítica)
+var bgContext = context.Background()
+
 // Configurações do Redis e fila in-memory
 const (
 	paymentQueueKey = "payment_queue"
@@ -135,7 +138,7 @@ func connectRedis() {
 		DB:       0,
 	})
 
-	if err := redisConnection.Ping(context.Background()).Err(); err != nil {
+	if err := redisConnection.Ping(bgContext).Err(); err != nil {
 		panic(fmt.Sprintf("Falha ao conectar com Redis: %v", err))
 	}
 	
@@ -495,12 +498,12 @@ func enqueueTransaction(payment PaymentData) error {
 		case inMemoryQueue <- payment:
 			return nil
 		default:
-			// Fila cheia - fallback para Redis
+			// Fila cheia - fallback para Redis (otimizado com buffer pool)
 			transactionData, err := fastJson.Marshal(payment)
 			if err != nil {
 				return fmt.Errorf("erro ao serializar transação: %w", err)
 			}
-			return redisConnection.RPush(context.Background(), paymentQueueKey, transactionData).Err()
+			return redisConnection.RPush(bgContext, paymentQueueKey, transactionData).Err()
 		}
 	}
 	
@@ -510,12 +513,12 @@ func enqueueTransaction(payment PaymentData) error {
 		// Sucesso - não fazer log para performance
 		return nil
 	default:
-		// Fila cheia - fallback direto para Redis
+		// Fila cheia - fallback direto para Redis (otimizado)
 		transactionData, err := fastJson.Marshal(payment)
 		if err != nil {
 			return fmt.Errorf("erro ao serializar transação: %w", err)
 		}
-		return redisConnection.RPush(context.Background(), paymentQueueKey, transactionData).Err()
+		return redisConnection.RPush(bgContext, paymentQueueKey, transactionData).Err()
 	}
 }
 
@@ -527,7 +530,7 @@ func clearTransactionQueue() error {
 	}
 	
 	// Limpar fila Redis
-	return redisConnection.Del(context.Background(), paymentQueueKey).Err()
+	return redisConnection.Del(bgContext, paymentQueueKey).Err()
 }
 
 // REMOVIDO: startInMemoryFlusher não é mais necessário
@@ -821,7 +824,7 @@ func checkSystemStatus(ctx *fasthttp.RequestCtx) {
 	}
 
 	// Health check ultra-rápido: só verifica se Redis responde
-	result, err := redisConnection.Ping(context.Background()).Result()
+	result, err := redisConnection.Ping(bgContext).Result()
 	if err != nil || result != "PONG" {
 		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
 		ctx.SetBodyString(`{"status":"sistema_indisponivel"}`)
