@@ -456,21 +456,22 @@ func preferDefaultProcessor(defaultHealth, fallbackHealth *HealthStatus) bool {
 // GERENCIADOR DE HEALTH CHECKS
 // ============================================================================
 
-// runHealthManager - Executa verificação periódica de saúde dos processadores
+// runHealthManager - Health check simplificado igual go-main
 func runHealthManager() {
 	ctx := context.Background()
 
-	// Throttling para evitar excesso de health checks
-	success, err := redisConnection.SetNX(ctx, healthControlKey, "1", healthCheckInterval).Result()
+	// Throttling identico a go-main: 5 segundos
+	success, err := redisConnection.SetNX(ctx, healthControlKey, "1", 5*time.Second).Result()
 	if err != nil || !success {
 		return
 	}
 
-	err = executeWithLock(ctx, healthLockKey, healthLockTimeout, func() {
+	// Lock identico a go-main: 5 segundos
+	err = executeWithLock(ctx, healthLockKey, 5*time.Second, func() {
 		updateProcessorCache(ctx)
 	})
 	if err != nil {
-		// Erro health manager (silenciado)
+		// Silenciar erro como go-main
 	}
 }
 
@@ -656,8 +657,8 @@ func processTransactionWithPersistence(ctx context.Context, transaction Transact
 	}
 
 	if sendError != nil {
-		// Processador falhou, recalcular e enviar para Redis
-		recalculateFailedProcessor(ctx, chosenProcessor)
+		// Falha temporária - apenas reenviar para Redis SEM marcar como failing
+		// Isso evita penalizar processador por falhas esporádicas
 		requeueTransaction(ctx, transaction)
 		return
 	}
@@ -694,8 +695,7 @@ func processTransaction(ctx context.Context, transaction TransactionPayload) {
 	}
 
 	if sendError != nil {
-		// Processador falhou, recalcular e recolocar na fila
-		recalculateFailedProcessor(ctx, chosenProcessor)
+		// Falha temporária - apenas recolocar na fila
 		requeueTransaction(ctx, transaction)
 		return
 	}
