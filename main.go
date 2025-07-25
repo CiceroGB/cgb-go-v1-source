@@ -49,20 +49,20 @@ var bgContext = context.Background()
 const (
 	paymentQueueKey = "payment_queue"
 	resultsTable    = "payment_results"
-	maxWorkers      = 200
-	channelBuffer   = 20000
+	maxWorkers      = 300         // Mais workers
+	channelBuffer   = 30000       // Buffer maior
 	
 	// Configurações da fila in-memory para otimização de performance
-	inMemoryQueueSize = 50000     // Buffer grande para absorver picos
-	batchSize         = 100       // Tamanho do batch para flush
-	batchTimeout      = 30 * time.Millisecond  // Flush máximo a cada 30ms
+	inMemoryQueueSize = 100000    // Buffer ainda maior para absorver picos
+	batchSize         = 150       // Batch maior
+	batchTimeout      = 20 * time.Millisecond  // Flush mais rápido
 )
 
 // Configurações de cache e health check
 const (
 	processorCacheKey     = "active_processor_cache"
 	selectionLockKey      = "processor_selection_lock"
-	cacheLifetime         = 10 * time.Second
+	cacheLifetime         = 20 * time.Second
 	selectionLockTimeout  = 3 * time.Second
 	
 	healthControlKey      = "health_check_control"
@@ -70,8 +70,8 @@ const (
 	healthCheckInterval   = 5 * time.Second
 	healthLockTimeout     = 5 * time.Second
 	
-	maxLatencyMs          = 50
-	latencyDifferenceMs   = 50
+	maxLatencyMs          = 80
+	latencyDifferenceMs   = 100
 )
 
 // ============================================================================
@@ -1000,15 +1000,17 @@ func runHTTPServer(ctx context.Context) {
 
 	server := &fasthttp.Server{
 		Handler:                       routerInstance.Handler,
-		ReadTimeout:                  3 * time.Second,    // Mais agressivo
-		WriteTimeout:                 3 * time.Second,    // Mais agressivo  
-		IdleTimeout:                  30 * time.Second,   // Reduzido
-		ReduceMemoryUsage:            true,
+		ReadTimeout:                  1 * time.Second,    // Ultra agressivo
+		WriteTimeout:                 1 * time.Second,    // Ultra agressivo  
+		IdleTimeout:                  10 * time.Second,   // Muito reduzido
+		ReduceMemoryUsage:            false,              // Priorizar velocidade
 		NoDefaultServerHeader:        true,
-		NoDefaultContentType:         true,               // Remove header desnecessário
-		DisableHeaderNamesNormalizing: true,              // Evita normalização
-		Concurrency:                  512 * 1024,         // Alta concorrência
-		MaxRequestBodySize:           4096,               // 4KB - margem para headers + JSON
+		NoDefaultContentType:         true,
+		DisableHeaderNamesNormalizing: true,
+		DisableKeepalive:             false,              // Manter keepalive
+		Concurrency:                  1024 * 1024,        // Máxima concorrência
+		MaxRequestBodySize:           2048,               // Ainda menor
+		TCPKeepalive:                 true,               // TCP otimizado
 	}
 
 	// Servidor em goroutine separada para permitir graceful shutdown
