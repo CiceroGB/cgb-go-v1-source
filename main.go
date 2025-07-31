@@ -1,1029 +1,827 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
+	"io"
 	"log"
 	"math"
+	"math/rand"
+	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/fasthttp/router"
-	jsoniter "github.com/json-iterator/go"
-	"github.com/redis/go-redis/v9"
-	"github.com/valyala/fasthttp"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/shopspring/decimal"
 )
 
 // ============================================================================
-// CONFIGURAÇÕES E VARIÁVEIS GLOBAIS
+// MODELS
 // ============================================================================
 
-var redisConnection *redis.Client
+type PaymentRequest struct {
+	CorrelationID uuid.UUID       `json:"correlationId"`
+	Amount        decimal.Decimal `json:"amount"`
+}
 
-// JSON otimizado para máxima performance (zero allocations)
-var fastJson = jsoniter.ConfigFastest
+type Payment struct {
+	CorrelationID uuid.UUID       `json:"correlationId"`
+	Amount        decimal.Decimal `json:"amount"`
+	ProcessedBy   string          `json:"processedBy"`
+	RequestedAt   time.Time       `json:"requestedAt"`
+}
 
-// URLs dos processadores de pagamento
-var defaultProcessorURL = getEnvVar("DEFAULT_PROCESSOR_URL", "http://payment-processor-default:8080")
-var fallbackProcessorURL = getEnvVar("FALLBACK_PROCESSOR_URL", "http://payment-processor-fallback:8080")
+type SummaryRow struct {
+	ProcessedBy   string
+	TotalRequests int64
+	TotalAmount   decimal.Decimal
+}
 
-// Cache do modo de operação (performance crítica - evita getEnvVar no hot path)
-var appMode = getEnvVar("MODE", "monolith")
+type SummaryResponse struct {
+	Default  Summary `json:"default"`
+	Fallback Summary `json:"fallback"`
+}
 
-// Object pools para reduzir GC pressure (performance crítica)
-var paymentDataPool = &sync.Pool{
+type Summary struct {
+	TotalRequests int64   `json:"totalRequests"`
+	TotalAmount   float64 `json:"totalAmount"`
+}
+
+// ============================================================================
+// CHANNELS
+// ============================================================================
+
+type ProcessorChannel struct {
+	ch chan PaymentRequest
+}
+
+func NewProcessorChannel() *ProcessorChannel {
+	return &ProcessorChannel{
+		// Use buffered channel with size similar to UnboundedChannel
+		// SingleReader = true optimization in Go is implicit with single goroutine reading
+		ch: make(chan PaymentRequest, 500000), // Increased buffer
+	}
+}
+
+func (c *ProcessorChannel) WriteAsync(req PaymentRequest) {
+	c.ch <- req // Never drop, just like UnboundedChannel in C#
+}
+
+func (c *ProcessorChannel) Reader() <-chan PaymentRequest {
+	return c.ch
+}
+
+type PersistenceChannel struct {
+	ch chan Payment
+}
+
+func NewPersistenceChannel() *PersistenceChannel {
+	return &PersistenceChannel{
+		ch: make(chan Payment, 500000), // Increased buffer
+	}
+}
+
+func (c *PersistenceChannel) WriteAsync(payment Payment) {
+	c.ch <- payment // Never drop, just like UnboundedChannel in C#
+}
+
+func (c *PersistenceChannel) Reader() <-chan Payment {
+	return c.ch
+}
+
+// ============================================================================
+// RETRY WITH BACKOFF
+// ============================================================================
+
+func decorrelatedJitterBackoffV2(attempt int) time.Duration {
+	const medianFirstRetryDelay = 1500.0 // 1.5s matching the reference
+	
+	if attempt == 0 {
+		return time.Duration(medianFirstRetryDelay) * time.Millisecond
+	}
+	
+	// Calculate upper bound
+	upperBound := medianFirstRetryDelay * math.Pow(2, float64(attempt))
+	
+	// Random jitter between 0 and upperBound
+	jitter := rand.Float64() * upperBound
+	
+	return time.Duration(jitter) * time.Millisecond
+}
+
+// ============================================================================
+// PAYMENT PROCESSOR SERVICE
+// ============================================================================
+
+type PaymentProcessorService struct {
+	client        *http.Client
+	baseURL       string
+	processorName string
+}
+
+func NewPaymentProcessorService(baseURL, name string, timeout time.Duration) *PaymentProcessorService {
+	// Configure connection pooling like the reference implementation's SetHandlerLifetime(5min)
+	transport := &http.Transport{
+		MaxIdleConns:        1000, // Match Kestrel MaxConcurrentConnections
+		MaxIdleConnsPerHost: 1000,
+		IdleConnTimeout:     5 * time.Minute, // Same as SetHandlerLifetime
+		DisableCompression:  true,
+		DisableKeepAlives:   false,
+		ForceAttemptHTTP2:   false, // Disable HTTP/2 for lower latency
+		MaxConnsPerHost:     1000,
+		TLSHandshakeTimeout: 10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	
+	return &PaymentProcessorService{
+		client: &http.Client{
+			Timeout:   timeout,
+			Transport: transport,
+		},
+		baseURL:       baseURL,
+		processorName: name,
+	}
+}
+
+func (s *PaymentProcessorService) ProcessAsync(ctx context.Context, payment Payment) bool {
+	// Try once without retry - retry is handled by ProcessWithRetry
+	resp, err := s.doRequest(ctx, payment)
+	if err != nil {
+		return false
+	}
+	defer func() {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
+	return resp.StatusCode >= 200 && resp.StatusCode < 300 // IsSuccessStatusCode
+}
+
+func (s *PaymentProcessorService) ProcessWithRetry(ctx context.Context, payment Payment) bool {
+	// Initial attempt
+	resp, err := s.doRequest(ctx, payment)
+	if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return true
+	}
+	
+	// Check if we should retry the initial attempt
+	shouldRetry := false
+	if err != nil {
+		// Network error = transient = retry
+		shouldRetry = true
+	} else if resp != nil {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		// Retry on 5xx (server errors) or 404 (same as the reference implementation)
+		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusNotFound {
+			shouldRetry = true
+		}
+	}
+	
+	if !shouldRetry {
+		return false
+	}
+	
+	// Now do up to 3 retries with backoff
+	for attempt := 0; attempt < 3; attempt++ {
+		resp, err := s.doRequest(ctx, payment)
+		
+		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			return true
+		}
+		
+		// Check if we should retry
+		shouldRetry := false
+		if err != nil {
+			// Network error = transient = retry
+			shouldRetry = true
+		} else if resp != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			// Retry on 5xx (server errors) or 404 (same as the reference implementation)
+			if resp.StatusCode >= 500 || resp.StatusCode == http.StatusNotFound {
+				shouldRetry = true
+			}
+		}
+		
+		if !shouldRetry {
+			return false
+		}
+		
+		// Wait with backoff
+		backoff := decorrelatedJitterBackoffV2(attempt)
+		select {
+		case <-time.After(backoff):
+			// Continue to next attempt
+		case <-ctx.Done():
+			return false
+		}
+	}
+	return false
+}
+
+func (s *PaymentProcessorService) doRequest(ctx context.Context, payment Payment) (*http.Response, error) {
+	// Marshal JSON like the reference implementation
+	data, err := json.Marshal(payment)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", s.baseURL+"/payments", bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	return s.client.Do(req)
+}
+
+// ============================================================================
+// ORCHESTRATOR SERVICE
+// ============================================================================
+
+type PaymentProcessingOrchestratorService struct {
+	defaultProcessor  *PaymentProcessorService
+	fallbackProcessor *PaymentProcessorService
+}
+
+func NewOrchestratorService() *PaymentProcessingOrchestratorService {
+	return &PaymentProcessingOrchestratorService{
+		defaultProcessor:  NewPaymentProcessorService("http://payment-processor-default:8080", "default", 10*time.Second),
+		fallbackProcessor: NewPaymentProcessorService("http://payment-processor-fallback:8080", "fallback", 30*time.Second),
+	}
+}
+
+func (s *PaymentProcessingOrchestratorService) ProcessAsync(ctx context.Context, payment *Payment) bool {
+	// Try default processor with retry policy
+	if s.defaultProcessor.ProcessWithRetry(ctx, *payment) {
+		payment.ProcessedBy = "default"
+		return true
+	}
+
+	// Try fallback processor with retry policy
+	if s.fallbackProcessor.ProcessWithRetry(ctx, *payment) {
+		payment.ProcessedBy = "fallback"
+		return true
+	}
+
+	return false
+}
+
+// ============================================================================
+// REPOSITORY
+// ============================================================================
+
+type PaymentRepository struct {
+	pool *pgxpool.Pool
+}
+
+func NewRepository(connString string) (*PaymentRepository, error) {
+	config, err := pgxpool.ParseConfig(connString)
+	if err != nil {
+		return nil, err
+	}
+
+	// Optimize for high concurrency
+	config.MaxConns = 256 // Match the reference implementation maximum pool size
+	config.MinConns = 50  // Higher min for faster response
+	config.MaxConnLifetime = 5 * time.Minute
+	config.MaxConnIdleTime = 1 * time.Minute
+
+	pool, err := pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		return nil, err
+	}
+
+	return &PaymentRepository{pool: pool}, nil
+}
+
+func (r *PaymentRepository) InsertBatchAsync(ctx context.Context, payments []Payment) error {
+	if len(payments) == 0 {
+		return nil
+	}
+
+	rows := make([][]interface{}, len(payments))
+	for i, p := range payments {
+		rows[i] = []interface{}{p.CorrelationID, p.Amount, p.ProcessedBy, p.RequestedAt}
+	}
+
+	_, err := r.pool.CopyFrom(
+		ctx,
+		pgx.Identifier{"payments"},
+		[]string{"correlation_id", "amount", "processed_by", "requested_at_utc"},
+		pgx.CopyFromRows(rows),
+	)
+	return err
+}
+
+func (r *PaymentRepository) GetProcessorsSummaryAsync(ctx context.Context, from, to *time.Time) ([]SummaryRow, error) {
+	query := `
+		SELECT 
+			processed_by,
+			COUNT(*) as total_requests,
+			SUM(amount) as total_amount
+		FROM payments
+		WHERE ($1::timestamptz IS NULL OR requested_at_utc >= $1)
+		  AND ($2::timestamptz IS NULL OR requested_at_utc <= $2)
+		GROUP BY processed_by
+	`
+
+	rows, err := r.pool.Query(ctx, query, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var summaries []SummaryRow
+	for rows.Next() {
+		var s SummaryRow
+		var totalAmount decimal.NullDecimal
+		if err := rows.Scan(&s.ProcessedBy, &s.TotalRequests, &totalAmount); err != nil {
+			return nil, err
+		}
+		if totalAmount.Valid {
+			s.TotalAmount = totalAmount.Decimal
+		} else {
+			s.TotalAmount = decimal.Zero
+		}
+		summaries = append(summaries, s)
+	}
+
+	return summaries, nil
+}
+
+func (r *PaymentRepository) PurgeAsync(ctx context.Context) error {
+	_, err := r.pool.Exec(ctx, "TRUNCATE TABLE payments")
+	return err
+}
+
+func (r *PaymentRepository) Close() {
+	r.pool.Close()
+}
+
+// ============================================================================
+// WORKER (BACKGROUND SERVICE) - SINGLE INSTANCE
+// ============================================================================
+
+func PaymentProcessingJob(
+	processorCh <-chan PaymentRequest,
+	persistenceCh *PersistenceChannel,
+	orchestrator *PaymentProcessingOrchestratorService,
+	wg *sync.WaitGroup,
+) {
+	defer wg.Done()
+
+	// Match the reference implementation exact parameters
+	const batchSize = 100
+	const maxWaitMs = 50
+	const maxParallelism = 10
+
+	// Pre-allocate with exact capacity to avoid reallocations
+	buffer := make([]PaymentRequest, 0, batchSize)
+	batchPool := &sync.Pool{
+		New: func() interface{} {
+			return make([]PaymentRequest, 0, batchSize)
+		},
+	}
+
+	for {
+		// Try to get first item
+		first, ok := <-processorCh
+		if !ok {
+			// Channel closed, process remaining buffer
+			if len(buffer) > 0 {
+				processBatch(buffer, persistenceCh, orchestrator, maxParallelism)
+			}
+			return
+		}
+		
+		buffer = append(buffer, first)
+		
+		// Collect batch with timeout (matching the reference)
+		batchStart := time.Now()
+		for len(buffer) < batchSize {
+			elapsed := time.Since(batchStart).Milliseconds()
+			if elapsed >= maxWaitMs {
+				break
+			}
+			
+			remaining := time.Duration(maxWaitMs-elapsed) * time.Millisecond
+			timer := time.NewTimer(remaining)
+			done := false
+			
+			select {
+			case req, ok := <-processorCh:
+				timer.Stop()
+				if !ok {
+					if len(buffer) > 0 {
+						processBatch(buffer, persistenceCh, orchestrator, maxParallelism)
+					}
+					return
+				}
+				buffer = append(buffer, req)
+				// Try to read more without blocking (like TryRead)
+				drain:
+				for len(buffer) < batchSize {
+					select {
+					case req, ok := <-processorCh:
+						if !ok {
+							done = true
+							break drain
+						}
+						buffer = append(buffer, req)
+					default:
+						break drain
+					}
+				}
+				if done {
+					break
+				}
+			case <-timer.C:
+				break
+			}
+		}
+
+		// Process batch
+		if len(buffer) > 0 {
+			// Use pool for better memory reuse
+			batch := buffer
+			buffer = batchPool.Get().([]PaymentRequest)[:0]
+			
+			processBatch(batch, persistenceCh, orchestrator, maxParallelism)
+			
+			// Return batch to pool after processing
+			batch = batch[:0]
+			batchPool.Put(batch)
+		}
+	}
+}
+
+// Removed workerPool - not needed with new approach
+
+// Worker pool with fixed workers like Parallel.ForEachAsync
+type workerJob struct {
+	req PaymentRequest
+	ctx context.Context
+}
+
+var jobPool = sync.Pool{
 	New: func() interface{} {
-		return &PaymentData{}
+		return &workerJob{}
 	},
 }
 
-// Pre-aloca context.Background() para evitar allocation repetida (performance crítica)
-var bgContext = context.Background()
-
-// Configurações do Redis e fila in-memory
-const (
-	paymentQueueKey = "payment_queue"
-	resultsTable    = "payment_results"
-	maxWorkers      = 300         // Mais workers
-	channelBuffer   = 30000       // Buffer maior
-	
-	// Configurações da fila in-memory para otimização de performance
-	inMemoryQueueSize = 100000    // Buffer ainda maior para absorver picos
-	batchSize         = 150       // Batch maior
-	batchTimeout      = 20 * time.Millisecond  // Flush mais rápido
-)
-
-// Configurações de cache e health check
-const (
-	processorCacheKey     = "active_processor_cache"
-	selectionLockKey      = "processor_selection_lock"
-	cacheLifetime         = 20 * time.Second
-	selectionLockTimeout  = 3 * time.Second
-	
-	healthControlKey      = "health_check_control"
-	healthLockKey         = "health_manager_lock"
-	healthCheckInterval   = 5 * time.Second
-	healthLockTimeout     = 5 * time.Second
-	
-	maxLatencyMs          = 80
-	latencyDifferenceMs   = 100
-)
-
-// ============================================================================
-// UTILITÁRIOS BÁSICOS
-// ============================================================================
-
-// getEnvVar - Obtém valor de variável de ambiente ou retorna padrão
-func getEnvVar(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
-}
-
-// ============================================================================
-// ESTRUTURAS DE DADOS PRINCIPAIS
-// ============================================================================
-
-// PaymentData - Representa uma solicitação de pagamento recebida
-type PaymentData struct {
-	CorrelationID string  `json:"correlationId"`
-	Amount        float64 `json:"amount"`
-}
-
-// Reset - Limpa dados para reutilização no pool (performance crítica)
-func (p *PaymentData) Reset() {
-	p.CorrelationID = ""
-	p.Amount = 0
-}
-
-// Validate - Verifica se os dados do pagamento são válidos
-func (p *PaymentData) Validate() error {
-	if p.CorrelationID == "" {
-		return errors.New("correlationId é obrigatório")
-	}
-	if p.Amount <= 0 {
-		return errors.New("valor deve ser maior que zero")
-	}
-	return nil
-}
-
-// HealthStatus - Resposta do endpoint de health check dos processadores
-type HealthStatus struct {
-	Failing         bool `json:"failing"`
-	ResponseTime    int  `json:"minResponseTime"`
-}
-
-// ProcessorRequest - Dados enviados para o processador de pagamento
-type ProcessorRequest struct {
-	CorrelationID string  `json:"correlationId"`
-	Amount        float64 `json:"amount"`
-	RequestedAt   string  `json:"requestedAt"`
-}
-
-// ============================================================================
-// CONEXÃO COM REDIS
-// ============================================================================
-
-// connectRedis - Inicializa conexão com Redis e testa conectividade
-func connectRedis() {
-	redisConnection = redis.NewClient(&redis.Options{
-		Addr:     getEnvVar("REDIS_URL", "rinha-redis:6379"),
-		Password: "",
-		DB:       0,
-	})
-
-	if err := redisConnection.Ping(bgContext).Err(); err != nil {
-		panic(fmt.Sprintf("Falha ao conectar com Redis: %v", err))
-	}
-	
-	log.Println("Redis conectado com sucesso")
-}
-
-// ============================================================================
-// CLIENTES HTTP PARA PROCESSADORES
-// ============================================================================
-
-var defaultHttpClient = &fasthttp.Client{
-	MaxConnsPerHost:               8192,
-	MaxIdleConnDuration:           90 * time.Second,
-	ReadTimeout:                   5 * time.Second,
-	WriteTimeout:                  5 * time.Second,
-	DisableHeaderNamesNormalizing: true,
-}
-
-var fallbackHttpClient = &fasthttp.Client{
-	MaxConnsPerHost:               8192,
-	MaxIdleConnDuration:           90 * time.Second,
-	ReadTimeout:                   5 * time.Second,
-	WriteTimeout:                  5 * time.Second,
-	DisableHeaderNamesNormalizing: true,
-}
-
-// sendPaymentDefault - Envia pagamento para o processador padrão
-func sendPaymentDefault(req ProcessorRequest) error {
-	reqBody, err := fastJson.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("erro ao serializar request: %w", err)
-	}
-
-	request := fasthttp.AcquireRequest()
-	response := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseRequest(request)
-	defer fasthttp.ReleaseResponse(response)
-
-	request.SetRequestURI(defaultProcessorURL + "/payments")
-	request.Header.SetMethod(fasthttp.MethodPost)
-	request.Header.SetContentType("application/json")
-	request.SetBody(reqBody)
-
-	if err := defaultHttpClient.Do(request, response); err != nil {
-		return fmt.Errorf("erro na comunicação HTTP: %w", err)
-	}
-
-	if response.StatusCode() != fasthttp.StatusOK {
-		return errors.New("processador padrão retornou status inesperado")
-	}
-
-	return nil
-}
-
-// checkDefaultHealth - Consulta health check do processador padrão
-func checkDefaultHealth() (*HealthStatus, error) {
-	req := fasthttp.AcquireRequest()
-	resp := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseRequest(req)
-	defer fasthttp.ReleaseResponse(resp)
-
-	req.SetRequestURI(defaultProcessorURL + "/payments/service-health")
-	req.Header.SetMethod(fasthttp.MethodGet)
-
-	if err := defaultHttpClient.Do(req, resp); err != nil {
-		return nil, fmt.Errorf("falha na consulta de saúde: %w", err)
-	}
-
-	if resp.StatusCode() != fasthttp.StatusOK {
-		return nil, errors.New("health check retornou status inválido")
-	}
-
-	var result HealthStatus
-	if err := fastJson.Unmarshal(resp.Body(), &result); err != nil {
-		return nil, fmt.Errorf("erro ao interpretar resposta: %w", err)
-	}
-
-	return &result, nil
-}
-
-// sendPaymentFallback - Envia pagamento para o processador de reserva
-func sendPaymentFallback(req ProcessorRequest) error {
-	reqBody, err := fastJson.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("erro ao serializar request: %w", err)
-	}
-
-	request := fasthttp.AcquireRequest()
-	response := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseRequest(request)
-	defer fasthttp.ReleaseResponse(response)
-
-	request.SetRequestURI(fallbackProcessorURL + "/payments")
-	request.Header.SetMethod(fasthttp.MethodPost)
-	request.Header.SetContentType("application/json")
-	request.SetBody(reqBody)
-
-	if err := fallbackHttpClient.Do(request, response); err != nil {
-		return fmt.Errorf("erro na comunicação HTTP: %w", err)
-	}
-
-	if response.StatusCode() != fasthttp.StatusOK {
-		return errors.New("processador de reserva retornou status inesperado")
-	}
-
-	return nil
-}
-
-// checkFallbackHealth - Consulta health check do processador de reserva
-func checkFallbackHealth() (*HealthStatus, error) {
-	req := fasthttp.AcquireRequest()
-	resp := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseRequest(req)
-	defer fasthttp.ReleaseResponse(resp)
-
-	req.SetRequestURI(fallbackProcessorURL + "/payments/service-health")
-	req.Header.SetMethod(fasthttp.MethodGet)
-
-	if err := fallbackHttpClient.Do(req, resp); err != nil {
-		return nil, fmt.Errorf("falha na consulta de saúde: %w", err)
-	}
-
-	if resp.StatusCode() != fasthttp.StatusOK {
-		return nil, errors.New("health check retornou status inválido")
-	}
-
-	var result HealthStatus
-	if err := fastJson.Unmarshal(resp.Body(), &result); err != nil {
-		return nil, fmt.Errorf("erro ao interpretar resposta: %w", err)
-	}
-
-	return &result, nil
-}
-
-// ============================================================================
-// SISTEMA DE TRAVAS DISTRIBUÍDAS
-// ============================================================================
-
-// executeWithLock - Executa função com trava Redis para evitar concorrência
-func executeWithLock(ctx context.Context, lockKey string, duration time.Duration, function func()) error {
-	lockValue := time.Now().UnixNano()
-
-	success, err := redisConnection.SetNX(ctx, lockKey, lockValue, duration).Result()
-	if err != nil || !success {
-		return errors.New("não foi possível obter a trava")
-	}
-	defer releaseLock(ctx, lockKey, lockValue)
-
-	function()
-	return nil
-}
-
-// releaseLock - Remove trava do Redis de forma atômica
-func releaseLock(ctx context.Context, lockKey string, lockValue int64) {
-	luaScript := `
-		if redis.call("GET", KEYS[1]) == ARGV[1] then
-			return redis.call("DEL", KEYS[1])
-		else
-			return 0
-		end
-	`
-	redisConnection.Eval(ctx, luaScript, []string{lockKey}, lockValue)
-}
-
-// ============================================================================
-// LÓGICA DE SELEÇÃO DE PROCESSADOR
-// ============================================================================
-
-// ProcessorCache - Armazena informações do processador selecionado
-type ProcessorCache struct {
-	CurrentProcessor    string          `json:"processador_atual"`
-	DefaultData        json.RawMessage `json:"dados_padrao"`
-	FallbackData       json.RawMessage `json:"dados_reserva"`
-	WasOverridden     bool            `json:"foi_sobrescrito"`
-	UpdateTimestamp    time.Time       `json:"timestamp_update"`
-}
-
-// updateProcessorCache - Consulta saúde dos processadores e atualiza cache
-func updateProcessorCache(ctx context.Context) error {
-	defaultHealth, _ := checkDefaultHealth()
-	fallbackHealth, _ := checkFallbackHealth()
-
-	chosenProcessor := chooseBestProcessor(defaultHealth, fallbackHealth)
-
-	return saveProcessorCache(ctx, chosenProcessor, defaultHealth, fallbackHealth, false)
-}
-
-// recalculateFailedProcessor - Recalcula processador quando um falha
-func recalculateFailedProcessor(ctx context.Context, failingProcessor string) error {
-	return executeWithLock(ctx, selectionLockKey, selectionLockTimeout, func() {
-		executeProcessorRecalculation(ctx, failingProcessor)
-	})
-}
-
-// executeProcessorRecalculation - Executa recálculo de processador em caso de falha
-func executeProcessorRecalculation(ctx context.Context, failingProcessor string) error {
-	cache, err := getProcessorCache(ctx)
-	if err != nil || cache == nil || cache.WasOverridden || failingProcessor != cache.CurrentProcessor {
-		return nil
-	}
-
-	defaultHealth := &HealthStatus{}
-	fallbackHealth := &HealthStatus{}
-
-	if err := fastJson.Unmarshal(cache.DefaultData, defaultHealth); err != nil {
-		return err
-	}
-	if err := fastJson.Unmarshal(cache.FallbackData, fallbackHealth); err != nil {
-		return err
-	}
-
-	// Marca o processador como falhando
-	if failingProcessor == "default" {
-		defaultHealth.Failing = true
-	} else {
-		fallbackHealth.Failing = true
-	}
-
-	chosenProcessor := chooseBestProcessor(defaultHealth, fallbackHealth)
-
-	return saveProcessorCache(ctx, chosenProcessor, defaultHealth, fallbackHealth, true)
-}
-
-// getCurrentProcessor - Retorna o processador atualmente ativo
-func getCurrentProcessor(ctx context.Context) (string, error) {
-	cache, err := getProcessorCache(ctx)
-	if err != nil || cache == nil {
-		return "default", nil
-	}
-
-	switch cache.CurrentProcessor {
-	case "default", "fallback":
-		return cache.CurrentProcessor, nil
-	default:
-		return "default", nil
-	}
-}
-
-// getProcessorCache - Recupera dados do cache do processador
-func getProcessorCache(ctx context.Context) (*ProcessorCache, error) {
-	cacheData, err := redisConnection.Get(ctx, processorCacheKey).Result()
-	if err != nil || cacheData == "" {
-		return nil, err
-	}
-
-	var cache ProcessorCache
-	if err := fastJson.Unmarshal([]byte(cacheData), &cache); err != nil {
-		return nil, err
-	}
-
-	return &cache, nil
-}
-
-// saveProcessorCache - Persiste dados do processador selecionado no cache
-func saveProcessorCache(ctx context.Context, processor string, defaultHealth, fallbackHealth *HealthStatus, overridden bool) error {
-	defaultDataJSON, err := fastJson.Marshal(defaultHealth)
-	if err != nil {
-		return fmt.Errorf("falha ao serializar dados padrão: %w", err)
-	}
-	fallbackDataJSON, err := fastJson.Marshal(fallbackHealth)
-	if err != nil {
-		return fmt.Errorf("falha ao serializar dados reserva: %w", err)
-	}
-
-	cache := ProcessorCache{
-		CurrentProcessor: processor,
-		DefaultData:     defaultDataJSON,
-		FallbackData:    fallbackDataJSON,
-		WasOverridden:  overridden,
-		UpdateTimestamp: time.Now().UTC(),
-	}
-
-	cacheData, err := fastJson.Marshal(cache)
-	if err != nil {
-		return fmt.Errorf("falha ao serializar cache: %w", err)
-	}
-
-	return redisConnection.Set(ctx, processorCacheKey, cacheData, cacheLifetime).Err()
-}
-
-// chooseBestProcessor - Algoritmo idêntico à go-main (testado e comprovado)
-func chooseBestProcessor(defaultHealth, fallbackHealth *HealthStatus) string {
-	switch {
-	case defaultHealth != nil && !defaultHealth.Failing && (fallbackHealth == nil || fallbackHealth.Failing):
-		return "default"
-
-	case fallbackHealth != nil && !fallbackHealth.Failing && (defaultHealth == nil || defaultHealth.Failing):
-		return "fallback"
-
-	case defaultHealth == nil && fallbackHealth == nil:
-		return "default"
-
-	case defaultHealth != nil && fallbackHealth != nil && !defaultHealth.Failing && !fallbackHealth.Failing:
-		if preferDefaultProcessor(defaultHealth, fallbackHealth) {
-			return "default"
-		}
-		return "fallback"
-	}
-
-	return "default"
-}
-
-// preferDefaultProcessor - Lógica EXATA da go-main (79% default comprovado)
-func preferDefaultProcessor(defaultHealth, fallbackHealth *HealthStatus) bool {
-	if defaultHealth.ResponseTime <= maxLatencyMs {
-		return true
-	}
-	if fallbackHealth.ResponseTime <= maxLatencyMs {
-		return false
-	}
-	return defaultHealth.ResponseTime < fallbackHealth.ResponseTime+latencyDifferenceMs
-}
-
-// ============================================================================
-// GERENCIADOR DE HEALTH CHECKS
-// ============================================================================
-
-// runHealthManager - Health check simplificado igual go-main
-func runHealthManager() {
+func processBatch(
+	batch []PaymentRequest,
+	persistenceCh *PersistenceChannel,
+	orchestrator *PaymentProcessingOrchestratorService,
+	maxParallelism int,
+) {
 	ctx := context.Background()
+	jobs := make(chan *workerJob, len(batch))
+	var wg sync.WaitGroup
 
-	// Throttling identico a go-main: 5 segundos
-	success, err := redisConnection.SetNX(ctx, healthControlKey, "1", 5*time.Second).Result()
-	if err != nil || !success {
-		return
-	}
+	// Start fixed workers (like Parallel.ForEachAsync)
+	for i := 0; i < maxParallelism; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Pre-allocate payment for reuse
+			payment := &Payment{}
+			
+			for job := range jobs {
+				// Reset and reuse payment struct
+				payment.CorrelationID = job.req.CorrelationID
+				payment.Amount = job.req.Amount
+				payment.RequestedAt = time.Now().UTC()
+				payment.ProcessedBy = ""
 
-	// Lock identico a go-main: 5 segundos
-	err = executeWithLock(ctx, healthLockKey, 5*time.Second, func() {
-		updateProcessorCache(ctx)
-	})
-	if err != nil {
-		// Silenciar erro como go-main
-	}
-}
-
-// ============================================================================
-// SISTEMA DE FILAS E PROCESSAMENTO
-// ============================================================================
-
-// TransactionPayload - Dados da transação a ser processada
-type TransactionPayload struct {
-	CorrelationID string  `json:"correlationId"`
-	Amount        float64 `json:"amount"`
-}
-
-var transactionChannel = make(chan []byte, channelBuffer)
-
-// Canal in-memory para otimização de performance - evita Redis na rota crítica
-var inMemoryQueue = make(chan PaymentData, inMemoryQueueSize)
-
-// enqueueTransaction - Adiciona transação na fila in-memory (não-bloqueante)
-func enqueueTransaction(payment PaymentData) error {
-	// MODO API HÍBRIDO: processar direto quando possível, Redis como fallback
-	if appMode == "api" {
-		// Tentar fila in-memory primeiro (ultra-rápido)
-		select {
-		case inMemoryQueue <- payment:
-			return nil
-		default:
-			// Fila cheia - fallback para Redis (otimizado com buffer pool)
-			transactionData, err := fastJson.Marshal(payment)
-			if err != nil {
-				return err
+				if orchestrator.ProcessAsync(job.ctx, payment) {
+					persistenceCh.WriteAsync(*payment)
+				}
+				// Return job to pool
+				jobPool.Put(job)
 			}
-			return redisConnection.RPush(bgContext, paymentQueueKey, transactionData).Err()
-		}
+		}()
 	}
-	
-	// Modo monolítico: usar fila in-memory real (sem Redis no hot path)
-	select {
-	case inMemoryQueue <- payment:
-		// Sucesso - não fazer log para performance
-		return nil
-	default:
-		// Fila cheia - fallback direto para Redis (otimizado)
-		transactionData, err := fastJson.Marshal(payment)
-		if err != nil {
-			return err
-		}
-		return redisConnection.RPush(bgContext, paymentQueueKey, transactionData).Err()
+
+	// Queue all jobs
+	for i := range batch {
+		job := jobPool.Get().(*workerJob)
+		job.req = batch[i]
+		job.ctx = ctx
+		jobs <- job
 	}
+	close(jobs)
+
+	wg.Wait()
 }
 
-// clearTransactionQueue - Remove todas as transações pendentes das filas
-func clearTransactionQueue() error {
-	// Limpar fila in-memory
-	for len(inMemoryQueue) > 0 {
-		<-inMemoryQueue
+func PaymentPersistingJob(
+	persistenceCh <-chan Payment,
+	repo *PaymentRepository,
+	wg *sync.WaitGroup,
+) {
+	defer wg.Done()
+
+	// Match the reference implementation exact parameters  
+	const batchSize = 200
+	const maxWaitMs = 40
+
+	// Pre-allocate with exact capacity
+	buffer := make([]Payment, 0, batchSize)
+	persistPool := &sync.Pool{
+		New: func() interface{} {
+			return make([]Payment, 0, batchSize)
+		},
 	}
-	
-	// Limpar fila Redis
-	return redisConnection.Del(bgContext, paymentQueueKey).Err()
-}
 
-// REMOVIDO: startInMemoryFlusher não é mais necessário
-// Agora processamos direto da inMemoryQueue para eliminar latência do Redis
-
-// startProcessingSystem - Inicia workers para processar transações
-func startProcessingSystem(ctx context.Context) {
-	// Sistema de processamento iniciado
-
-	// REMOVIDO: Flusher in-memory não é mais necessário no hot path
-	// Transações vão direto para workers, Redis apenas para persistência após sucesso
-
-	// Inicia enfileirador Redis-to-Channel (para recovery/fallback)
-	go startRedisEnqueuer(ctx, 1)
-
-	// Inicia workers para processar transações DIRETO da inMemoryQueue
-	for i := 0; i < maxWorkers; i++ {
-		go startInMemoryWorker(ctx, i+1)
-	}
-	
-	// Workers adicionais para processar do Redis (recovery)
-	for i := 0; i < 10; i++ {
-		go startProcessingWorker(ctx, i+1)
-	}
-}
-
-// startRedisEnqueuer - Move transações do Redis para canal interno
-func startRedisEnqueuer(ctx context.Context, workerId int) {
-	// Enfileirador iniciado
-	
 	for {
-		select {
-		case <-ctx.Done():
-			// Enfileirador finalizando
+		// Try to get first item
+		first, ok := <-persistenceCh
+		if !ok {
+			// Channel closed, flush remaining buffer
+			if len(buffer) > 0 {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if err := repo.InsertBatchAsync(ctx, buffer); err != nil {
+					log.Printf("Erro ao persistir o batch final: %v", err)
+				}
+				cancel()
+			}
 			return
-		default:
-			result, err := redisConnection.BLPop(ctx, 1*time.Second, paymentQueueKey).Result()
-			if err == redis.Nil || len(result) < 2 {
-				continue
-			} else if err != nil {
-				// Erro no enfileirador (silenciado para performance)
-				continue
-			}
-
-			message := result[1]
-
-			select {
-			case transactionChannel <- []byte(message):
-				// Transação enviada para canal interno
-			default:
-				// Canal cheio, recolocar na fila
-				_ = redisConnection.LPush(ctx, paymentQueueKey, message).Err()
-			}
 		}
-	}
-}
-
-// startInMemoryWorker - Processa transações DIRETO da inMemoryQueue (hot path)
-func startInMemoryWorker(ctx context.Context, workerId int) {
-	// InMemory Worker iniciado - processa direto sem Redis
-	
-	for {
-		select {
-		case <-ctx.Done():
-			// Worker finalizando
-			return
-		case payment := <-inMemoryQueue:
-			// Converter PaymentData para TransactionPayload
-			transaction := TransactionPayload{
-				CorrelationID: payment.CorrelationID,
-				Amount:        payment.Amount,
+		
+		buffer = append(buffer, first)
+		
+		// Collect batch with timeout (matching the reference)
+		batchStart := time.Now()
+		for len(buffer) < batchSize {
+			elapsed := time.Since(batchStart).Milliseconds()
+			if elapsed >= maxWaitMs {
+				break
 			}
 			
-			// Processar direto - sem passar pelo Redis!
-			processTransactionWithPersistence(ctx, transaction)
-		}
-	}
-}
-
-// startProcessingWorker - Processa transações do canal interno (Redis recovery)
-func startProcessingWorker(ctx context.Context, workerId int) {
-	// Worker iniciado
-	
-	for {
-		select {
-		case <-ctx.Done():
-			// Worker finalizando
-			return
-		case transactionData := <-transactionChannel:
-			var transaction TransactionPayload
-			if err := fastJson.Unmarshal(transactionData, &transaction); err != nil {
-				// Erro deserializacao (silenciado)
-				continue
+			remaining := time.Duration(maxWaitMs-elapsed) * time.Millisecond
+			timer := time.NewTimer(remaining)
+			done := false
+			
+			select {
+			case payment, ok := <-persistenceCh:
+				timer.Stop()
+				if !ok {
+					if len(buffer) > 0 {
+						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+						if err := repo.InsertBatchAsync(ctx, buffer); err != nil {
+							log.Printf("Erro ao persistir o batch final: %v", err)
+						}
+						cancel()
+					}
+					return
+				}
+				buffer = append(buffer, payment)
+				// Try to read more without blocking (like TryRead)
+				drain2:
+				for len(buffer) < batchSize {
+					select {
+					case payment, ok := <-persistenceCh:
+						if !ok {
+							done = true
+							break drain2
+						}
+						buffer = append(buffer, payment)
+					default:
+						break drain2
+					}
+				}
+				if done {
+					break
+				}
+			case <-timer.C:
+				break
 			}
-			processTransaction(ctx, transaction)
+		}
+
+		// Persist batch
+		if len(buffer) > 0 {
+			// Use pool for better memory reuse
+			batch := buffer
+			buffer = persistPool.Get().([]Payment)[:0]
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := repo.InsertBatchAsync(ctx, batch); err != nil {
+				log.Printf("Erro ao persistir o batch: %v", err)
+				// In the reference implementation, errors are logged but batch is lost
+			}
+			cancel()
+			
+			// Return batch to pool
+			batch = batch[:0]
+			persistPool.Put(batch)
 		}
 	}
 }
 
-// processTransactionWithPersistence - Processa transação e persiste no Redis APÓS sucesso
-func processTransactionWithPersistence(ctx context.Context, transaction TransactionPayload) {
-	chosenProcessor, err := getCurrentProcessor(ctx)
-	if err != nil {
-		// Em caso de erro, enviar para Redis para retry
-		requeueTransaction(ctx, transaction)
-		return
-	}
-
-	params := ProcessorRequest{
-		CorrelationID: transaction.CorrelationID,
-		Amount:        transaction.Amount,
-		RequestedAt:   time.Now().UTC().Format(time.RFC3339Nano),
-	}
-
-	var sendError error
-	switch chosenProcessor {
-	case "default":
-		sendError = sendPaymentDefault(params)
-	case "fallback":
-		sendError = sendPaymentFallback(params)
-	default:
-		sendError = sendPaymentDefault(params)
-	}
-
-	if sendError != nil {
-		// Falha temporária - apenas reenviar para Redis SEM marcar como failing
-		// Isso evita penalizar processador por falhas esporádicas
-		requeueTransaction(ctx, transaction)
-		return
-	}
-
-	// Sucesso! Agora sim persiste no Redis (fora do hot path)
-	saveProcessedTransaction(ctx, transaction, chosenProcessor, params.RequestedAt)
-	
-	// Opcional: salvar em lote no Redis para log/auditoria
-	// Isso pode ser feito async sem bloquear
-}
-
-// processTransaction - Processa uma transação individual (usado pelo recovery do Redis)
-func processTransaction(ctx context.Context, transaction TransactionPayload) {
-	chosenProcessor, err := getCurrentProcessor(ctx)
-	if err != nil {
-		requeueTransaction(ctx, transaction)
-		return
-	}
-
-	params := ProcessorRequest{
-		CorrelationID: transaction.CorrelationID,
-		Amount:        transaction.Amount,
-		RequestedAt:   time.Now().UTC().Format(time.RFC3339Nano),
-	}
-
-	var sendError error
-	switch chosenProcessor {
-	case "default":
-		sendError = sendPaymentDefault(params)
-	case "fallback":
-		sendError = sendPaymentFallback(params)
-	default:
-		sendError = sendPaymentDefault(params)
-	}
-
-	if sendError != nil {
-		// Falha temporária - apenas recolocar na fila
-		requeueTransaction(ctx, transaction)
-		return
-	}
-
-	// Transação processada com sucesso, salvar no histórico
-	saveProcessedTransaction(ctx, transaction, chosenProcessor, params.RequestedAt)
-}
-
-// requeueTransaction - Recoloca transação na fila em caso de falha
-func requeueTransaction(ctx context.Context, transaction TransactionPayload) {
-	transactionData, _ := fastJson.Marshal(transaction)
-	_ = redisConnection.LPush(ctx, paymentQueueKey, transactionData).Err()
-}
-
-// saveProcessedTransaction - Salva transação processada no histórico
-func saveProcessedTransaction(ctx context.Context, transaction TransactionPayload, processor, timestamp string) {
-	transactionRecord := map[string]interface{}{
-		"correlationId": transaction.CorrelationID,
-		"amount":        transaction.Amount,
-		"processor":     processor,
-		"requestedAt":   timestamp,
-	}
-	dataJSON, _ := fastJson.Marshal(transactionRecord)
-	_ = redisConnection.HSet(ctx, resultsTable, transaction.CorrelationID, dataJSON).Err()
-}
-
 // ============================================================================
-// RELATÓRIOS E RESUMOS
+// HTTP HANDLERS
 // ============================================================================
 
-// TransactionRecord - Representa uma transação armazenada
-type TransactionRecord struct {
-	Amount       float64 `json:"amount"`
-	Processor string  `json:"processor"`
-	RequestedAt string  `json:"requestedAt"`
-}
-
-// ProcessorSummary - Estatísticas por processador
-type ProcessorSummary struct {
-	TotalTransactions int     `json:"totalRequests"`
-	TotalAmount      float64 `json:"totalAmount"`
-}
-
-// generatePaymentsReport - Gera relatório de pagamentos por período
-func generatePaymentsReport(startDate, endDate string) (map[string]ProcessorSummary, error) {
-	ctx := context.Background()
-
-	allRecords, err := redisConnection.HGetAll(ctx, resultsTable).Result()
-	if err != nil {
-		return nil, fmt.Errorf("erro ao buscar histórico: %w", err)
-	}
-
-	start, _ := parseDateTime(startDate)
-	end, _ := parseDateTime(endDate)
-
-	report := map[string]ProcessorSummary{
-		"default":  {0, 0},
-		"fallback": {0, 0},
-	}
-
-	for _, dataJSON := range allRecords {
-		var record TransactionRecord
-		if err := fastJson.Unmarshal([]byte(dataJSON), &record); err != nil {
-			continue
+func handlePayment(processorCh *ProcessorChannel) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
 		}
 
-		transactionTime, err := time.Parse(time.RFC3339Nano, record.RequestedAt)
+		// Decode directly from body - most efficient approach
+		var req PaymentRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		// the reference implementation uses Guid which auto-validates, but NO validation on Amount
+		// Just send to channel and return Accepted
+		processorCh.WriteAsync(req)
+		w.WriteHeader(http.StatusAccepted)
+	}
+}
+
+func handleSummary(repo *PaymentRepository) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		var from, to *time.Time
+		
+		if fromStr := r.URL.Query().Get("from"); fromStr != "" {
+			if t, err := time.Parse(time.RFC3339, fromStr); err == nil {
+				from = &t
+			}
+		}
+		
+		if toStr := r.URL.Query().Get("to"); toStr != "" {
+			if t, err := time.Parse(time.RFC3339, toStr); err == nil {
+				to = &t
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		summaries, err := repo.GetProcessorsSummaryAsync(ctx, from, to)
 		if err != nil {
-			continue
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 
-		if !withinTimeRange(transactionTime, start, end) {
-			continue
+		response := SummaryResponse{
+			Default:  Summary{TotalRequests: 0, TotalAmount: 0},
+			Fallback: Summary{TotalRequests: 0, TotalAmount: 0},
 		}
 
-		if summary, exists := report[record.Processor]; exists {
-			summary.TotalTransactions++
-			summary.TotalAmount += record.Amount
-			report[record.Processor] = summary
+		for _, s := range summaries {
+			switch s.ProcessedBy {
+			case "default":
+				response.Default.TotalRequests = s.TotalRequests
+				response.Default.TotalAmount, _ = s.TotalAmount.Float64()
+			case "fallback":
+				response.Fallback.TotalRequests = s.TotalRequests
+				response.Fallback.TotalAmount, _ = s.TotalAmount.Float64()
+			}
 		}
+
+		// Pre-allocate buffer for response
+		buf, _ := json.Marshal(response)
+		
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(buf)
 	}
-
-	roundReportValues(report)
-	return report, nil
 }
 
-// parseDateTime - Converte string em time.Time
-func parseDateTime(dateStr string) (time.Time, bool) {
-	if dateStr == "" {
-		return time.Time{}, false
-	}
-	convertedDate, err := time.Parse(time.RFC3339Nano, dateStr)
-	return convertedDate, err == nil
-}
-
-// withinTimeRange - Verifica se data está dentro do intervalo especificado
-func withinTimeRange(timestamp time.Time, start time.Time, end time.Time) bool {
-	if !start.IsZero() && timestamp.Before(start) {
-		return false
-	}
-	if !end.IsZero() && timestamp.After(end) {
-		return false
-	}
-	return true
-}
-
-// roundReportValues - Arredonda valores monetários para 2 casas decimais
-func roundReportValues(report map[string]ProcessorSummary) {
-	for key, summary := range report {
-		report[key] = ProcessorSummary{
-			TotalTransactions: summary.TotalTransactions,
-			TotalAmount:      math.Round(summary.TotalAmount*100) / 100.0,
+func handlePurge(repo *PaymentRepository) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
 		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		if err := repo.PurgeAsync(ctx); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
 	}
+}
+
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
 }
 
 // ============================================================================
-// HANDLERS HTTP
-// ============================================================================
-
-// checkSystemStatus - Endpoint de health check do sistema (otimizado)
-func checkSystemStatus(ctx *fasthttp.RequestCtx) {
-	if !ctx.IsGet() {
-		ctx.SetStatusCode(fasthttp.StatusMethodNotAllowed)
-		return
-	}
-
-	// Health check ultra-rápido: só verifica se Redis responde
-	result, err := redisConnection.Ping(bgContext).Result()
-	if err != nil || result != "PONG" {
-		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
-		ctx.SetBodyString(`{"status":"sistema_indisponivel"}`)
-		return
-	}
-
-	ctx.SetContentType("application/json")
-	ctx.SetBodyString(`{"status":"sistema_operacional"}`)
-}
-
-// receivePaymentRequest - Endpoint para receber novos pagamentos (otimizado com object pool)
-func receivePaymentRequest(ctx *fasthttp.RequestCtx) {
-	if !ctx.IsPost() {
-		ctx.SetStatusCode(fasthttp.StatusMethodNotAllowed)
-		return
-	}
-
-	// Obter objeto do pool para reduzir GC pressure
-	paymentData := paymentDataPool.Get().(*PaymentData)
-	defer func() {
-		paymentData.Reset()
-		paymentDataPool.Put(paymentData)
-	}()
-
-	if err := fastJson.Unmarshal(ctx.PostBody(), paymentData); err != nil {
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.SetBodyString("formato de dados inválido")
-		return
-	}
-
-	if err := paymentData.Validate(); err != nil {
-		ctx.SetStatusCode(fasthttp.StatusBadRequest)
-		ctx.SetBodyString(err.Error())
-		return
-	}
-
-	if err := enqueueTransaction(*paymentData); err != nil {
-		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
-		ctx.SetBodyString("falha ao processar solicitação")
-		return
-	}
-
-	ctx.SetStatusCode(fasthttp.StatusAccepted)
-}
-
-// clearDatabase - Endpoint administrativo para limpar filas (otimizado)
-func clearDatabase(ctx *fasthttp.RequestCtx) {
-	if !ctx.IsPost() {
-		ctx.SetStatusCode(fasthttp.StatusMethodNotAllowed)
-		return
-	}
-
-	if err := clearTransactionQueue(); err != nil {
-		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
-		ctx.SetBodyString("falha ao limpar base de dados")
-		return
-	}
-
-	ctx.SetContentType("application/json")
-	ctx.SetBodyString(`{"message":"Base de dados limpa com sucesso"}`)
-}
-
-// getTransactionsSummary - Endpoint para obter resumo de transações
-func getTransactionsSummary(ctx *fasthttp.RequestCtx) {
-	startDateBytes := ctx.QueryArgs().Peek("from")
-	endDateBytes := ctx.QueryArgs().Peek("to")
-	
-	var startDate, endDate string
-	if len(startDateBytes) > 0 {
-		startDate = string(startDateBytes)
-	}
-	if len(endDateBytes) > 0 {
-		endDate = string(endDateBytes)
-	}
-
-	report, err := generatePaymentsReport(startDate, endDate)
-	if err != nil {
-		ctx.SetStatusCode(fasthttp.StatusInternalServerError)
-		ctx.SetBodyString("falha ao gerar relatório")
-		return
-	}
-
-	ctx.SetContentType("application/json")
-	reportJSON, _ := fastJson.Marshal(report)
-	ctx.SetBody(reportJSON)
-}
-
-// ============================================================================
-// FUNÇÕES PRINCIPAIS DE INICIALIZAÇÃO
+// MAIN (PROGRAM.CS EQUIVALENT)  
 // ============================================================================
 
 func main() {
-	connectRedis()
+	// Set GOMAXPROCS to use all available CPUs
+	runtime.GOMAXPROCS(runtime.NumCPU())
 	
-	ctx, cancel := context.WithCancel(bgContext)
-	defer cancel()
-
-	// Captura sinais do sistema para encerramento gracioso
-	go func() {
-		signalChannel := make(chan os.Signal, 1)
-		signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
-		<-signalChannel
-		log.Println("Sinal de encerramento recebido")
-		cancel()
-	}()
-
-	switch appMode {
-	case "api":
-		log.Println("Iniciando modo API HÍBRIDO")
-		// API com workers próprios para eliminar latência do Redis
-		go startProcessingSystem(ctx)
-		runHTTPServer(ctx)
-		
-	case "worker":
-		log.Println("Iniciando modo Worker")
-		// Apenas workers de processamento
-		go startProcessingSystem(ctx)
-		
-		// Inicia gerenciador de health checks
-		go func() {
-			heartbeat := time.NewTicker(2 * time.Second)
-			defer heartbeat.Stop()
-
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-heartbeat.C:
-					runHealthManager()
-				}
-			}
-		}()
-		
-		// Aguarda sinal de encerramento
-		<-ctx.Done()
-		
-	default:
-		// Modo monolítico (fallback)
-		log.Println("Iniciando modo monolítico")
-		
-		// Inicia workers de processamento em background
-		go startProcessingSystem(ctx)
-		
-		// Inicia gerenciador de health checks
-		go func() {
-			heartbeat := time.NewTicker(2 * time.Second)
-			defer heartbeat.Stop()
-
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-heartbeat.C:
-					runHealthManager()
-				}
-			}
-		}()
-
-		// Inicia servidor HTTP (blocking)
-		runHTTPServer(ctx)
+	// Pre-allocate decoder buffers like the reference implementation uses JsonSerializer
+	json.Valid([]byte(`{}`))
+	
+	// GC settings
+	debug.SetGCPercent(100) // Default GC
+	debug.SetMemoryLimit(300 * 1024 * 1024) // 300MB limit
+	
+	// Database connection
+	connString := "postgres://user:password@postgres:5432/PaymentsDB?sslmode=disable"
+	repo, err := NewRepository(connString)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
 	}
-}
+	defer repo.Close()
 
-// runHTTPServer - Servidor HTTP monolítico (API + Workers no mesmo processo)
-func runHTTPServer(ctx context.Context) {
-	log.Println("Servidor HTTP iniciado na porta 8080")
+	// Initialize channels (DI equivalent)
+	processorCh := NewProcessorChannel()
+	persistenceCh := NewPersistenceChannel()
+
+	// Initialize services
+	orchestrator := NewOrchestratorService()
+
+	// Start background services (HostedService equivalent)
+	var wg sync.WaitGroup
 	
-	routerInstance := router.New()
-	routerInstance.GET("/healthcheck", checkSystemStatus)
-	routerInstance.POST("/payments", receivePaymentRequest)
-	routerInstance.GET("/payments-summary", getTransactionsSummary)
-	routerInstance.POST("/purge-payments", clearDatabase)
+	// Start SINGLE PaymentProcessingJob worker (like the reference implementation)
+	wg.Add(1)
+	go PaymentProcessingJob(processorCh.Reader(), persistenceCh, orchestrator, &wg)
 
-	server := &fasthttp.Server{
-		Handler:                       routerInstance.Handler,
-		ReadTimeout:                  1 * time.Second,    // Ultra agressivo
-		WriteTimeout:                 1 * time.Second,    // Ultra agressivo  
-		IdleTimeout:                  10 * time.Second,   // Muito reduzido
-		ReduceMemoryUsage:            false,              // Priorizar velocidade
-		NoDefaultServerHeader:        true,
-		NoDefaultContentType:         true,
-		DisableHeaderNamesNormalizing: true,
-		DisableKeepalive:             false,              // Manter keepalive
-		Concurrency:                  1024 * 1024,        // Máxima concorrência
-		MaxRequestBodySize:           2048,               // Ainda menor
-		TCPKeepalive:                 true,               // TCP otimizado
+	// Start SINGLE PaymentPersistingJob worker (like the reference implementation)
+	wg.Add(1)
+	go PaymentPersistingJob(persistenceCh.Reader(), repo, &wg)
+
+	// Routes are configured in the mux above
+
+	// Configure and start server (like Kestrel in the reference implementation)
+	// Custom handler to avoid DefaultServeMux overhead
+	mux := http.NewServeMux()
+	mux.HandleFunc("/payments", handlePayment(processorCh))
+	mux.HandleFunc("/payments-summary", handleSummary(repo))
+	mux.HandleFunc("/purge-payments", handlePurge(repo))
+	mux.HandleFunc("/healthz", handleHealth)
+	
+	server := &http.Server{
+		Addr:              ":80",
+		Handler:           mux,
+		ReadTimeout:       60 * time.Second,  // Match Kestrel RequestHeadersTimeout
+		WriteTimeout:      60 * time.Second,  // Match Kestrel RequestHeadersTimeout
+		IdleTimeout:       120 * time.Second, // KeepAliveTimeout
+		MaxHeaderBytes:    1 << 10,           // 1KB - smaller for payment requests
+		ReadHeaderTimeout: 1 * time.Second,   // Further reduced
 	}
 
-	// Servidor em goroutine separada para permitir graceful shutdown
+	// Graceful shutdown
 	go func() {
-		if err := server.ListenAndServe(":8080"); err != nil {
-			log.Fatalf("Erro no servidor: %v", err)
+		log.Println("Server starting on :80")
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server failed: %v", err)
 		}
 	}()
 
-	// Aguarda sinal de encerramento
-	<-ctx.Done()
+	// Wait for interrupt signal
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Println("Shutting down server...")
+
+	// Shutdown server
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	
-	// Graceful shutdown
-	log.Println("Finalizando servidor HTTP")
-	server.Shutdown()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("Server forced to shutdown: %v", err)
+	}
+
+	// Close channels and wait for workers
+	close(processorCh.ch)
+	close(persistenceCh.ch)
+	wg.Wait()
+
+	log.Println("Server shutdown complete")
 }

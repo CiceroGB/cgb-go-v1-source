@@ -1,21 +1,18 @@
-module cgb-go-v1
+module rinha-payment-gateway
 
-go 1.23.4
+go 1.21
 
 require (
-	github.com/fasthttp/router v1.5.4
-	github.com/json-iterator/go v1.1.12
-	github.com/redis/go-redis/v9 v9.11.0
-	github.com/valyala/fasthttp v1.63.0
+	github.com/google/uuid v1.5.0
+	github.com/jackc/pgx/v5 v5.5.1
+	github.com/shopspring/decimal v1.4.0
 )
 
 require (
-	github.com/andybalholm/brotli v1.2.0 // indirect
-	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
-	github.com/klauspost/compress v1.18.0 // indirect
-	github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421 // indirect
-	github.com/modern-go/reflect2 v1.0.2 // indirect
-	github.com/savsgio/gotils v0.0.0-20240704082632-aef3928b8a38 // indirect
-	github.com/valyala/bytebufferpool v1.0.0 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20221227161230-091c0ba34f0a // indirect
+	github.com/jackc/puddle/v2 v2.2.1 // indirect
+	golang.org/x/crypto v0.16.0 // indirect
+	golang.org/x/sync v0.5.0 // indirect
+	golang.org/x/text v0.14.0 // indirect
 )

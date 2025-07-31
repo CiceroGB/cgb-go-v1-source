@@ -1,109 +1,79 @@
+x-api_template: &api_template
+  build:
+    context: .
+    dockerfile: Dockerfile
+  networks:
+    - backend
+    - payment-processor
+  depends_on:
+    postgres:
+      condition: service_healthy
+  deploy:
+    resources:
+      limits:
+        cpus: "0.5"
+        memory: "100MB"
+
 services:
-  redis:
-    image: redis:8.0.3-alpine
-    container_name: cgb-redis
-    restart: unless-stopped
-    command:
-      [
-        "redis-server",
-        "--save",
-        "",
-        "--appendonly",
-        "no",
-        "--maxclients",
-        "10000",
-        "--tcp-backlog",
-        "511",
-        "--timeout",
-        "0",
-        "--tcp-keepalive",
-        "300"
-      ]
+  api01:
+    <<: *api_template
+    hostname: api01
+  
+  api02:
+    <<: *api_template
+    hostname: api02
+  
+  postgres:
+    image: postgres:15-alpine
+    hostname: postgres
+    command: >-
+      postgres -c max_connections=400
+               -c shared_buffers=64MB
+               -c synchronous_commit=off
+               -c fsync=off
+               -c full_page_writes=off
+               -c wal_level=minimal
+               -c max_wal_senders=0
+               -c checkpoint_timeout=30min
+               -c log_min_duration_statement=-1
+    environment:
+      POSTGRES_DB: PaymentsDB
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d PaymentsDB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.3"
+          memory: "100MB"
+  
+  nginx:
+    image: nginx
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "9999:80"
+    depends_on:
+      - api01
+      - api02
     networks:
       - backend
     deploy:
       resources:
         limits:
           cpus: "0.2"
-          memory: "65MB"
-
-  api1:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: cgb-api1
-    networks:
-      - backend
-    depends_on:
-      - redis
-    environment:
-      - REDIS_URL=redis:6379
-      - MODE=api
-    deploy:
-      resources:
-        limits:
-          cpus: '0.3'
-          memory: '70MB'
-
-  api2:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: cgb-api2
-    networks:
-      - backend
-    depends_on:
-      - redis
-    environment:
-      - REDIS_URL=redis:6379
-      - MODE=api
-    deploy:
-      resources:
-        limits:
-          cpus: '0.3'
-          memory: '70MB'
-
-  worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: cgb-worker
-    networks:
-      - backend
-      - payment-processor
-    depends_on:
-      - redis
-    environment:
-      - REDIS_URL=redis:6379
-      - DEFAULT_PROCESSOR_URL=http://payment-processor-default:8080
-      - FALLBACK_PROCESSOR_URL=http://payment-processor-fallback:8080
-      - MODE=worker
-    deploy:
-      resources:
-        limits:
-          cpus: '0.45'
-          memory: '105MB'
-
-  nginx:
-    image: nginx:1.27.0-alpine
-    container_name: cgb-nginx
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-    ports:
-      - 9999:9999
-    depends_on:
-      - api1
-      - api2
-    networks:
-      - backend
-    deploy:
-      resources:
-        limits:
-          cpus: '0.25'
-          memory: '40MB'
+          memory: "50MB"
 
 networks:
   backend:
-    driver: bridge
   payment-processor:
     external: true
